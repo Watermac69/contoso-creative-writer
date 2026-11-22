@@ -10,6 +10,7 @@ from .backtest import fetch_and_run, format_result
 from .brokers import make_broker
 from .config import load_config
 from .engine import Engine, State
+from .journal import Journal
 from .llm_filter import LLMFilter
 from .market import KrakenMarket, fetch_headlines
 
@@ -23,7 +24,7 @@ def build(cfg):
         cfg, make_broker(cfg), KrakenMarket(cfg), state,
         llm=llm if llm.enabled else None,
         news=lambda: fetch_headlines(cfg.news_feeds),
-        log_dir=state_dir,
+        journal=Journal(state_dir / "agent.db"),
     )
     return engine, state, state_path, llm
 
@@ -36,7 +37,9 @@ def cycle(engine, state, state_path) -> None:
     for note in result.notes:
         print(f"  {note}")
     for f in result.fills:
-        print(f"  ORDER {f.side} {f.qty:.6f} {f.symbol} @ {f.price:.2f} (fee {f.fee:.2f})")
+        pnl = f"" if f.pnl is None else f", result {f.pnl:+.2f}"
+        print(f"  ORDER {f.side} {f.qty:.6f} {f.symbol} @ {f.price:.2f} "
+              f"(fee {f.fee:.2f}{pnl}) - {f.reason}")
 
 
 def main() -> None:
@@ -68,6 +71,12 @@ def main() -> None:
                 total += value
                 print(f"  {a.symbol}: {qty:.6f} = {value:.2f} EUR")
         print(f"  Cash: {cash:.2f} EUR\n  Equity: {total:.2f} EUR (start {cfg.start_capital_eur:.2f})")
+        s = engine.journal.stats()
+        rate = f"{s['wins'] / s['sells']:.0%}" if s["sells"] else "n/a"
+        print(f"  Orders: {s['orders']} | sells: {s['sells']} ({s['wins']} wins, {s['losses']} losses, "
+              f"hit rate {rate}) | realised {s['realized_pnl']:+.2f} EUR | costs {s['fees']:.2f} EUR")
+        for reason, count, pnl in s["by_reason"]:
+            print(f"    {reason}: {count} sells, {pnl:+.2f} EUR")
         if state.halted:
             print(f"  HALTED: {state.halt_reason}")
         for sym, reason in state.llm_reasons.items():

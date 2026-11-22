@@ -22,6 +22,9 @@ class HistoricalMarket:
     def price(self, symbol: str) -> float:
         return self.candles[symbol][self.i].open
 
+    def spread(self, symbol: str) -> float:
+        return 0.0  # historical spreads are unknown; costs are covered by cfg.slippage
+
     def daily_closes(self, symbol: str) -> list[float]:
         return [c.close for c in self.candles[symbol][: self.i]]
 

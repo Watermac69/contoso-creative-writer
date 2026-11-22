@@ -1,10 +1,8 @@
 """One decision cycle: prices -> risk checks -> signals -> LLM filter -> orders."""
 from __future__ import annotations
 
-import csv
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .brokers import Fill
@@ -20,6 +18,7 @@ class State:
     halted: bool = False
     halt_reason: str = ""
     high_water: dict[str, float] = field(default_factory=dict)  # highest price since entry
+    cost_basis: dict[str, float] = field(default_factory=dict)  # average cost per unit, fees included
     cooldown_until: dict[str, float] = field(default_factory=dict)
     llm_time: float = 0.0
     llm_multipliers: dict[str, float] = field(default_factory=dict)
@@ -43,16 +42,33 @@ class CycleResult:
 
 
 class Engine:
-    def __init__(self, cfg: Config, broker, market, state: State, llm=None, news=None, log_dir=None):
+    def __init__(self, cfg: Config, broker, market, state: State, llm=None, news=None, journal=None):
         self.cfg, self.broker, self.market, self.state = cfg, broker, market, state
         self.llm = llm  # object with .multipliers(signals, headlines), or None
         self.news = news  # callable returning headlines, or None
-        self.log_dir = Path(log_dir) if log_dir else None
+        self.journal = journal  # Journal, or None (backtests)
 
-    def _sell_all(self, symbol: str, price: float, fills: list[Fill]) -> None:
+    def _order(self, symbol: str, side: str, qty: float, price: float, reason: str,
+               fills: list[Fill]) -> None:
+        """Place an order, attach its reason and keep the cost basis up to date."""
+        st = self.state
+        held = self.broker.get_qty(symbol)
+        fill = self.broker.market_order(symbol, side, qty, price)
+        fill.reason = reason
+        if side == "buy":
+            old = st.cost_basis.get(symbol, 0.0) * held
+            st.cost_basis[symbol] = (old + fill.qty * fill.price + fill.fee) / (held + fill.qty)
+        else:
+            basis = st.cost_basis.get(symbol, fill.price)
+            fill.pnl = fill.qty * (fill.price - basis) - fill.fee
+            if self.broker.get_qty(symbol) * price < 1.0:
+                st.cost_basis.pop(symbol, None)
+        fills.append(fill)
+
+    def _sell_all(self, symbol: str, price: float, reason: str, fills: list[Fill]) -> None:
         qty = self.broker.get_qty(symbol)
         if qty * price >= 1.0:
-            fills.append(self.broker.market_order(symbol, "sell", qty, price))
+            self._order(symbol, "sell", qty, price, reason, fills)
         self.state.high_water.pop(symbol, None)
 
     def _llm_multipliers(self, signals, now: float) -> dict[str, float]:
@@ -63,6 +79,8 @@ class Engine:
             mults, reasons = self.llm.multipliers(signals, headlines)
             self.state.llm_time = now
             self.state.llm_multipliers, self.state.llm_reasons = mults, reasons
+            if self.journal:
+                self.journal.record_llm(now, mults, reasons, headlines)
         return self.state.llm_multipliers
 
     def run_cycle(self, now: float) -> CycleResult:
@@ -74,6 +92,7 @@ class Engine:
         equity = cash + sum(qty[s] * prices[s] for s in symbols)
         fills: list[Fill] = []
         notes: list[str] = []
+        decisions: list[dict] = []
 
         # 1. Kill switch
         st.peak_equity = max(st.peak_equity, equity)
@@ -84,13 +103,13 @@ class Engine:
                 f"below its peak {st.peak_equity:.2f}"
             )
             for s in symbols:
-                self._sell_all(s, prices[s], fills)
+                self._sell_all(s, prices[s], "kill switch", fills)
             notes.append(f"KILL SWITCH: {st.halt_reason}")
         if st.halted:
             notes.append("halted - no trading until 'reset-halt'")
-            return self._finish(now, prices, fills, notes)
+            return self._finish(now, prices, fills, notes, decisions)
 
-        # 2. Trailing stops
+        # 2. Trailing stops (protective: executed regardless of spread)
         blocked = {s for s in symbols if st.cooldown_until.get(s, 0) > now}
         for s in symbols:
             if qty[s] * prices[s] < 1.0:
@@ -99,7 +118,7 @@ class Engine:
             st.high_water[s] = max(st.high_water.get(s, prices[s]), prices[s])
             if prices[s] < st.high_water[s] * (1 - cfg.trailing_stop):
                 notes.append(f"trailing stop {s} at {prices[s]:.2f}")
-                self._sell_all(s, prices[s], fills)
+                self._sell_all(s, prices[s], "trailing stop", fills)
                 st.cooldown_until[s] = now + cfg.stop_cooldown_days * DAY
                 blocked.add(s)
 
@@ -107,8 +126,16 @@ class Engine:
         signals = [compute_signal(s, self.market.daily_closes(s), cfg) for s in symbols]
         mults = self._llm_multipliers(signals, now)
         targets = target_weights(signals, mults, cfg, blocked)
+        spreads = {s: self.market.spread(s) for s in symbols}
         for sig in signals:
-            notes.append(f"{sig.symbol}: {sig.reason} -> target {targets[sig.symbol]:.0%}")
+            s = sig.symbol
+            notes.append(f"{s}: {sig.reason} -> target {targets[s]:.0%}")
+            decisions.append({
+                "symbol": s, "price": prices[s], "spread": spreads[s], "active": sig.active,
+                "momentum": sig.momentum, "vol": sig.vol, "llm_multiplier": mults.get(s, 1.0),
+                "target_weight": targets[s], "reason": sig.reason,
+            })
+        by_symbol = {sig.symbol: sig for sig in signals}
 
         # 4. Orders: sells first so the cash is there for buys
         qty = {s: self.broker.get_qty(s) for s in symbols}
@@ -120,38 +147,35 @@ class Engine:
             small = abs(delta) < max(cfg.min_order_eur, cfg.rebalance_threshold * equity)
             if small and not closing:
                 continue
+            if spreads[s] > cfg.max_spread:
+                notes.append(f"{s}: spread {spreads[s]:.2%} above limit, order postponed")
+                continue
+            sig = by_symbol[s]
             if delta < 0:
                 if closing:
-                    self._sell_all(s, prices[s], fills)
+                    if s in blocked:
+                        why = "stop cooldown"
+                    elif not sig.active:
+                        why = "trend ended"
+                    else:
+                        why = "llm filter"
+                    self._sell_all(s, prices[s], why, fills)
                 else:
-                    fills.append(self.broker.market_order(s, "sell", -delta / prices[s], prices[s]))
+                    why = "llm filter" if mults.get(s, 1.0) < 1.0 else "rebalance"
+                    self._order(s, "sell", -delta / prices[s], prices[s], why, fills)
             else:
                 budget = self.broker.get_cash() / (1 + cfg.fee_rate + cfg.slippage) * 0.999
                 spend = min(delta, budget)
                 if spend < cfg.min_order_eur:
                     continue
-                fills.append(self.broker.market_order(s, "buy", spend / prices[s], prices[s]))
+                why = "rebalance" if qty[s] * prices[s] >= 1.0 else "trend signal"
+                self._order(s, "buy", spend / prices[s], prices[s], why, fills)
                 st.high_water[s] = max(st.high_water.get(s, 0.0), prices[s])
-        return self._finish(now, prices, fills, notes)
+        return self._finish(now, prices, fills, notes, decisions)
 
-    def _finish(self, now, prices, fills, notes) -> CycleResult:
+    def _finish(self, now, prices, fills, notes, decisions) -> CycleResult:
         cash = self.broker.get_cash()
         equity = cash + sum(self.broker.get_qty(s) * p for s, p in prices.items())
-        if self.log_dir:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds")
-            _append(self.log_dir / "equity.csv", ["time", "equity", "cash"],
-                    [stamp, f"{equity:.2f}", f"{cash:.2f}"])
-            for f in fills:
-                _append(self.log_dir / "trades.csv", ["time", "symbol", "side", "qty", "price", "fee"],
-                        [stamp, f.symbol, f.side, f"{f.qty:.8f}", f"{f.price:.2f}", f"{f.fee:.4f}"])
+        if self.journal:
+            self.journal.record_cycle(now, equity, cash, self.state.halted, decisions, fills)
         return CycleResult(equity, cash, fills, notes)
-
-
-def _append(path: Path, header: list[str], row: list[str]) -> None:
-    new = not path.exists()
-    with path.open("a", newline="") as fh:
-        writer = csv.writer(fh)
-        if new:
-            writer.writerow(header)
-        writer.writerow(row)

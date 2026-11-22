@@ -6,6 +6,7 @@ from agent.backtest import run_backtest
 from agent.brokers import PaperBroker, kraken_signature
 from agent.config import Config, load_config
 from agent.engine import DAY, Engine, State
+from agent.journal import Journal
 from agent.llm_filter import parse_multipliers
 from agent.market import Candle
 from agent.strategy import Signal, compute_signal, target_weights
@@ -15,6 +16,10 @@ class FakeMarket:
     def __init__(self, closes: dict[str, list[float]], prices: dict[str, float] | None = None):
         self.closes = closes
         self.prices = prices or {s: c[-1] for s, c in closes.items()}
+        self.spreads: dict[str, float] = {}
+
+    def spread(self, symbol):
+        return self.spreads.get(symbol, 0.0)
 
     def price(self, symbol):
         return self.prices[symbol]
@@ -31,11 +36,12 @@ def falling(n=80, start=200.0, step=1.0):
     return [start - i * step for i in range(n)]
 
 
-def make_engine(closes, cfg=None, llm=None, state=None, prices=None):
+def make_engine(closes, cfg=None, llm=None, state=None, prices=None, journal=None):
     cfg = cfg or Config()
     broker = PaperBroker(cfg)
     market = FakeMarket(dict(closes), prices)
-    return Engine(cfg, broker, market, state or State(), llm=llm, news=lambda: ["headline"]), broker, market
+    return Engine(cfg, broker, market, state or State(), llm=llm, news=lambda: ["headline"],
+                  journal=journal), broker, market
 
 
 ALL_UP = {"BTC": rising(), "ETH": rising(), "SOL": rising()}
@@ -206,3 +212,101 @@ def test_backtest_runs_on_synthetic_history_without_lookahead():
     assert result.trades >= 3
     assert result.end > result.start  # steady uptrend must be profitable
     assert not result.halted
+
+
+def test_every_order_carries_its_reason():
+    cfg = Config(max_drawdown=0.9)
+    engine, _, market = make_engine(ALL_UP, cfg)
+    assert {f.reason for f in engine.run_cycle(0.0).fills} == {"trend signal"}
+    market.closes["ETH"] = falling()
+    market.prices["ETH"] = 175.0
+    market.prices["BTC"] = 100.0
+    reasons = {f.symbol: f.reason for f in engine.run_cycle(900.0).fills if f.side == "sell"}
+    # SOL is trimmed too: after BTC's fall it is too large a share of the smaller equity
+    assert reasons == {"BTC": "trailing stop", "ETH": "trend ended", "SOL": "rebalance"}
+
+
+def test_kill_switch_and_llm_sells_are_labelled():
+    engine, _, market = make_engine(ALL_UP)
+    engine.run_cycle(0.0)
+    market.prices = {s: p * 0.6 for s, p in market.prices.items()}
+    assert {f.reason for f in engine.run_cycle(900.0).fills} == {"kill switch"}
+
+    class Cut:
+        mult = 1.0
+
+        def multipliers(self, signals, headlines):
+            return {"BTC": self.mult, "ETH": 1.0, "SOL": 1.0}, {}
+
+    llm = Cut()
+    engine, _, _ = make_engine(ALL_UP, llm=llm)
+    engine.run_cycle(1_000_000.0)
+    llm.mult = 0.0
+    fills = engine.run_cycle(1_000_000.0 + 7 * 3600).fills
+    assert [(f.symbol, f.reason) for f in fills] == [("BTC", "llm filter")]
+
+
+def test_realised_profit_includes_costs_on_both_sides():
+    cfg = Config(max_drawdown=0.9, trailing_stop=0.9)
+    engine, broker, market = make_engine(ALL_UP, cfg)
+    buy = next(f for f in engine.run_cycle(0.0).fills if f.symbol == "BTC")
+    market.closes["BTC"] = falling()
+    market.prices["BTC"] = 200.0
+    sell = engine.run_cycle(900.0).fills[0]
+    expected = sell.qty * sell.price - sell.fee - (buy.qty * buy.price + buy.fee)
+    assert sell.pnl == pytest.approx(expected)
+    assert sell.pnl > 0
+    assert "BTC" not in engine.state.cost_basis
+
+
+def test_wide_spread_postpones_orders_but_not_stops():
+    cfg = Config(max_drawdown=0.9)
+    engine, broker, market = make_engine(ALL_UP, cfg)
+    market.spreads = {"BTC": cfg.max_spread * 2}
+    result = engine.run_cycle(0.0)
+    assert {f.symbol for f in result.fills} == {"ETH", "SOL"}
+    assert any("postponed" in n for n in result.notes)
+    market.spreads = {"ETH": cfg.max_spread * 2}
+    market.prices["ETH"] = 100.0  # stop level breached while the spread is wide
+    fills = engine.run_cycle(900.0).fills
+    assert ("ETH", "trailing stop") in [(f.symbol, f.reason) for f in fills]
+
+
+def test_journal_records_cycles_decisions_trades_and_stats(tmp_path):
+    cfg = Config(max_drawdown=0.9, trailing_stop=0.9)
+    journal = Journal(tmp_path / "agent.db")
+    engine, _, market = make_engine(ALL_UP, cfg, journal=journal)
+    engine.run_cycle(0.0)
+    market.closes["BTC"] = falling()
+    market.prices["BTC"] = 200.0  # sold with a profit
+    market.closes["ETH"] = falling()
+    market.prices["ETH"] = 170.0  # sold with a loss
+    engine.run_cycle(900.0)
+
+    count = lambda table: journal.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    assert count("cycles") == 2
+    assert count("decisions") == 6
+    assert count("trades") == 5
+    row = journal.db.execute(
+        "SELECT active, target_weight, reason FROM decisions WHERE symbol='BTC' ORDER BY time DESC"
+    ).fetchone()
+    assert row[0] == 0 and row[1] == 0.0 and "below" in row[2]
+
+    stats = Journal(tmp_path / "agent.db").stats()  # survives a restart
+    assert (stats["orders"], stats["sells"], stats["wins"], stats["losses"]) == (5, 2, 1, 1)
+    assert stats["by_reason"][0][0] == "trend ended"
+
+
+def test_journal_keeps_llm_answers_with_the_headlines_shown():
+    class Stub:
+        def multipliers(self, signals, headlines):
+            return {"BTC": 0.5, "ETH": 1.0, "SOL": 1.0}, {"BTC": "exchange hack"}
+
+    journal = Journal()
+    engine, _, _ = make_engine(ALL_UP, llm=Stub(), journal=journal)
+    engine.run_cycle(1_000_000.0)
+    rows = journal.db.execute(
+        "SELECT symbol, multiplier, reason, headlines FROM llm_calls ORDER BY symbol"
+    ).fetchall()
+    assert rows[0] == ("BTC", 0.5, "exchange hack", '["headline"]')
+    assert len(rows) == 3

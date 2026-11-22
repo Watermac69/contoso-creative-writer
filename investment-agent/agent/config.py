@@ -41,6 +41,7 @@ class Config:
     max_drawdown: float = 0.25  # kill switch: sell everything and halt
     rebalance_threshold: float = 0.05  # ignore weight differences smaller than this
     min_order_eur: float = 10.0
+    max_spread: float = 0.005  # no new orders while bid/ask are further apart than this
 
     # Costs assumed in paper trading and backtests
     fee_rate: float = 0.004

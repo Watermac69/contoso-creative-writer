@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+import time
 from dataclasses import dataclass
 
 import requests
@@ -42,11 +43,25 @@ class KrakenMarket:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._tickers: dict[str, tuple[float, dict]] = {}
 
-    def price(self, symbol: str) -> float:
+    def _ticker(self, symbol: str) -> dict:
+        cached = self._tickers.get(symbol)
+        if cached and time.monotonic() - cached[0] < 5:
+            return cached[1]
         result = kraken_public("Ticker", pair=self.cfg.asset(symbol).pair)
         ticker = next(iter(result.values()))
-        return float(ticker["c"][0])
+        self._tickers[symbol] = (time.monotonic(), ticker)
+        return ticker
+
+    def price(self, symbol: str) -> float:
+        return float(self._ticker(symbol)["c"][0])
+
+    def spread(self, symbol: str) -> float:
+        """Distance between best ask and best bid, relative to their midpoint."""
+        t = self._ticker(symbol)
+        ask, bid = float(t["a"][0]), float(t["b"][0])
+        return (ask - bid) / ((ask + bid) / 2)
 
     def daily_closes(self, symbol: str) -> list[float]:
         candles = fetch_daily_candles(self.cfg.asset(symbol).pair)

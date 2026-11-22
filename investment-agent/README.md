@@ -13,6 +13,9 @@ Jeder Zyklus (alle 15 Minuten) läuft in dieser Reihenfolge:
 3. **Regeln (Trendfolge):** Ein Wert wird nur gehalten, wenn sein Kurs über dem 50-Tage-Durchschnitt liegt und die 30-Tage-Rendite positiv ist. Sonst bleibt sein Anteil in Cash.
 4. **KI-Filter:** Claude liest aktuelle Schlagzeilen und kann eine Position verkleinern oder streichen, aber nie vergrößern. Fällt die KI aus oder fehlt der API-Schlüssel, läuft der Agent rein regelbasiert weiter.
 5. **Positionsgröße:** BTC, ETH und SOL bekommen je einen gleich großen Anteil, zusammen höchstens 95 % des Vermögens und höchstens 40 % pro Wert. Schwankt ein Wert stärker als das Ziel, schrumpft sein Anteil.
+6. **Spannen-Prüfung:** Liegen Kauf- und Verkaufskurs mehr als 0,5 % auseinander, wird die Order auf den nächsten Zyklus verschoben. Trailing-Stop und Not-Aus verkaufen trotzdem.
+
+Jede Order bekommt einen Grund: `trend signal`, `rebalance`, `trend ended`, `llm filter`, `trailing stop`, `stop cooldown` oder `kill switch`.
 
 Alle Werte stehen in `agent/config.py` und lassen sich in `config.json` überschreiben.
 
@@ -25,14 +28,31 @@ pip install -r requirements.txt
 python -m agent backtest     # Regeln an ~22 Monaten Kraken-Historie prüfen
 python -m agent once         # einen Zyklus ausführen
 python -m agent run          # Dauerbetrieb
-python -m agent status       # Depot, Cash, letzte KI-Einschätzung
+python -m agent status       # Depot, Cash, Trefferquote, letzte KI-Einschätzung
 python -m agent reset-halt   # Not-Aus aufheben
 python -m pytest             # Tests
 ```
 
 Für den KI-Filter muss `ANTHROPIC_API_KEY` gesetzt sein. Er wird alle sechs Stunden befragt.
 
-Kontostand, Trades und Vermögensverlauf liegen in `state/` (`paper_account.json`, `trades.csv`, `equity.csv`).
+## Journal (Datenbank)
+
+Der Agent schreibt alles in eine SQLite-Datei, `state/agent.db`. Sie braucht keinen Server und lässt sich mit jedem SQLite-Werkzeug oder mit pandas auswerten.
+
+| Tabelle | Inhalt |
+|---|---|
+| `cycles` | pro Zyklus: Vermögen, Cash, Not-Aus-Status |
+| `decisions` | pro Wert und Zyklus: Kurs, Spanne, Signal, KI-Faktor, Zielanteil, Begründung |
+| `trades` | pro Order: Menge, Kurs, Gebühr, Grund, bei Verkäufen der realisierte Gewinn nach Kosten |
+| `llm_calls` | pro KI-Abfrage: Faktor und Begründung je Wert, dazu die gezeigten Schlagzeilen |
+
+Beispiel:
+
+```bash
+sqlite3 state/agent.db "SELECT reason, COUNT(*), ROUND(SUM(pnl),2) FROM trades WHERE side='sell' GROUP BY reason"
+```
+
+Bei 15-Minuten-Zyklen wächst die Datei um etwa 400 Zeilen pro Tag. Der Kontostand des Paper-Kontos liegt daneben in `state/paper_account.json`.
 
 ## 24/7-Betrieb
 
@@ -49,20 +69,22 @@ docker logs -f agent
 
 ## Backtest-Ergebnis
 
-Stand 12.11.2026, Zeitraum 12.01.2025 bis 11.11.2026, 1.000 € Start, inklusive 0,4 % Gebühr und 0,1 % Slippage pro Order, ohne KI-Filter:
+Stand 22.11.2026, Zeitraum 22.01.2025 bis 21.11.2026, 1.000 € Start, inklusive 0,4 % Gebühr und 0,1 % Slippage pro Order, ohne KI-Filter:
 
 | | Endwert | Rendite | Größter Rückgang |
 |---|---|---|---|
-| Agent (nur Regeln) | 973,65 € | −2,6 % | 28,4 % |
-| BTC kaufen und halten | 710,01 € | −29,0 % | 51,7 % |
-| BTC, ETH, SOL zu gleichen Teilen halten | 562,51 € | −43,7 % | 62,9 % |
+| Agent (nur Regeln) | 955,22 € | −4,5 % | 28,4 % |
+| BTC kaufen und halten | 544,73 € | −45,5 % | 51,7 % |
+| BTC, ETH, SOL zu gleichen Teilen halten | 426,82 € | −57,3 % | 62,4 % |
 
 So ist das zu lesen:
 
 - Der Agent hat in einem fallenden Markt Kapital geschont, aber **keinen Gewinn gemacht**.
-- In diesem Lauf hat der Not-Aus ausgelöst; danach blieb der Agent in Cash. Ohne Not-Aus wären es +3,1 % bei 40,4 % Rückgang gewesen. Das Ergebnis hängt also spürbar an dieser einen Grenze.
-- 70 Trades haben rund 83 € Kosten verursacht, bei 1.000 € ein großer Posten.
+- In diesem Lauf hat der Not-Aus ausgelöst; danach blieb der Agent in Cash. Ohne Not-Aus wären es +1,2 % bei 40,4 % Rückgang gewesen. Das Ergebnis hängt also spürbar an dieser einen Grenze.
+- 69 Trades haben rund 81 € Kosten verursacht, bei 1.000 € ein großer Posten.
 - Ein einzelner Zeitraum beweist nichts über die Zukunft. Die Parameter wurden nicht auf diese Daten optimiert.
+
+**Breitere Auswahl geprüft und verworfen:** Mit zehn Werten (zusätzlich XRP, ADA, DOGE, LINK, LTC, DOT, AVAX) endet derselbe Backtest bei 835,33 € (−16,5 %, 238 Trades). Die kleineren Coins haben in diesem Zeitraum mehr Fehlsignale geliefert, deshalb bleibt es bei BTC, ETH und SOL.
 
 ## Live-Handel freischalten
 

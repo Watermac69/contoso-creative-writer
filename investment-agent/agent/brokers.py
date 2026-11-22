@@ -24,6 +24,8 @@ class Fill:
     qty: float
     price: float
     fee: float
+    reason: str = ""
+    pnl: float | None = None  # realised profit after costs, sells only
 
 
 class PaperBroker:
