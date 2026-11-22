@@ -1,10 +1,31 @@
 # Investment-Agent
 
-Ein eigenständiger Handelsagent, der ein Startkapital (Standard: 1.000 €) rund um die Uhr in Krypto verwaltet. Er startet im **Paper-Trading**: echte Kraken-Kurse, simuliertes Geld.
+Ein eigenständiger Handelsagent, der ein Startkapital (Standard: 1.000 €) selbstständig verwaltet. Er startet im **Paper-Trading**: echte Kurse, simuliertes Geld.
 
 > **Kein Gewinnversprechen.** Der Agent kann Geld verlieren, im Live-Betrieb echtes. Die eingebauten Grenzen begrenzen Verluste, verhindern sie aber nicht. Das hier ist Software, keine Anlageberatung.
 
-## Wie er entscheidet
+## Drei Profile
+
+| Profil | Start mit | Was er handelt | Kursquelle | Live-Handel |
+|---|---|---|---|---|
+| Krypto | `config.json` | BTC, ETH, SOL | Kraken | vorbereitet (Kraken), gesperrt |
+| Aktien | `config.stocks.json` | die 5 stärksten aus rund 140 großen US- und DAX-Aktien | Yahoo Finance | noch nicht möglich |
+| ETFs | `config.etf.json` | Aktien Welt, Schwellenländer, Anleihen, Gold | Yahoo Finance | noch nicht möglich |
+
+Jedes Profil hat ein eigenes Paper-Konto und Journal (`state/`, `state-stocks/`, `state-etf/`). Alle Befehle unten nehmen `--config`, zum Beispiel `python -m agent run --config config.stocks.json`.
+
+### So wählt das Aktien-Profil aus
+
+- **Rangliste:** Einmal pro Woche werden alle Aktien nach ihrer 6-Monats-Rendite sortiert. Gekauft werden die fünf stärksten, die außerdem über ihrem 200-Tage-Durchschnitt liegen, je mit bis zu 19 % des Vermögens.
+- **Halten:** Eine gehaltene Aktie bleibt, solange sie unter den zehn stärksten ist. Das vermeidet ständiges Umschichten.
+- **Marktfilter:** Liegt der Weltindex-ETF (EUNL.DE) unter seinem 200-Tage-Durchschnitt, werden keine neuen Positionen eröffnet.
+- **Ausstieg:** Trailing-Stop bei 20 %, Trendbruch oder Abrutschen in der Rangliste.
+- **Not-Aus:** Bei 20 % Rückgang verkauft er alles und nimmt den Handel nach 30 Tagen von selbst wieder auf.
+- **Kosten:** 0,05 % pro Order, mindestens 1,25 €, dazu 0,1 % Slippage. US-Kurse werden in Euro umgerechnet.
+
+Das ETF-Profil nutzt dieselben Regeln ohne Rangliste, prüft alle vier Wochen und hat engere Grenzen (Stop 12 %, Not-Aus 15 %).
+
+## Wie er entscheidet (Krypto-Profil)
 
 Jeder Zyklus (alle 15 Minuten) läuft in dieser Reihenfolge:
 
@@ -67,7 +88,7 @@ docker logs -f agent
 
 `.env` legst du aus `.env.example` an.
 
-## Backtest-Ergebnis
+## Backtest-Ergebnis Krypto
 
 Stand 22.11.2026, Zeitraum 22.01.2025 bis 21.11.2026, 1.000 € Start, inklusive 0,4 % Gebühr und 0,1 % Slippage pro Order, ohne KI-Filter:
 
@@ -86,6 +107,30 @@ So ist das zu lesen:
 
 **Breitere Auswahl geprüft und verworfen:** Mit zehn Werten (zusätzlich XRP, ADA, DOGE, LINK, LTC, DOT, AVAX) endet derselbe Backtest bei 835,33 € (−16,5 %, 238 Trades). Die kleineren Coins haben in diesem Zeitraum mehr Fehlsignale geliefert, deshalb bleibt es bei BTC, ETH und SOL.
 
+## Backtest-Ergebnis Aktien und ETFs
+
+Stand 22.11.2026, rund 9 Jahre (2017 bis 2026), inklusive Kosten, ohne KI-Filter:
+
+| | Rendite pro Jahr | Größter Rückgang |
+|---|---|---|
+| Aktien-Profil, 1.000 € Start | +9,8 % | 26,6 % |
+| Aktien-Profil, 10.000 € Start | +14,8 % | 24,8 % |
+| ETF-Profil, 1.000 € Start | +3,3 % | 11,2 % |
+| Weltindex-ETF kaufen und halten | +12,6 % | 33,2 % |
+| Alle Aktien der Auswahl zu gleichen Teilen halten | +17,3 % | 32,2 % |
+
+So ist das zu lesen:
+
+- **Mit 1.000 € schlägt das Aktien-Profil den Weltindex nicht.** 548 Orders zu mindestens 1,25 € haben 685 € gekostet. Mit 10.000 € fallen dieselben Gebühren kaum ins Gewicht.
+- **Die Auswahl ist geschönt.** Sie besteht aus den heutigen Indexmitgliedern. Firmen, die in den neun Jahren abgestiegen sind, fehlen. Deshalb liegt „alle halten" so hoch, und auch das Agenten-Ergebnis ist dadurch zu gut.
+- **Das ETF-Profil ist sicher, aber schwach.** Es hatte den kleinsten Rückgang, hat aber die meisten Aufwärtsphasen nur teilweise mitgenommen.
+- **Das Aktien-Profil schwankt weniger als der Markt** und hatte 2018 und 2020 klar bessere Jahre, 2019, 2021 und 2025 klar schlechtere.
+- Die Parameter wurden vorab festgelegt und nicht auf diese Daten optimiert.
+
+Nachrechnen: `python -m agent backtest --config config.stocks.json` (lädt zehn Jahre Kurse, dauert rund eine Minute).
+
+**Grenzen des Aktien- und ETF-Profils:** Der Paper-Handel bucht zum letzten bekannten Kurs, auch wenn die Börse geschlossen ist. Bruchteile von Aktien werden vorausgesetzt. Yahoo liefert keine Kauf- und Verkaufskurse, die Spannen-Prüfung greift hier also nicht.
+
 ## Live-Handel freischalten
 
 Erst nach einigen Wochen Paper-Trading, und nur mit Geld, dessen Verlust du verkraftest.
@@ -97,6 +142,6 @@ Erst nach einigen Wochen Paper-Trading, und nur mit Geld, dessen Verlust du verk
 
 Der Live-Pfad ist noch **nicht gegen ein echtes Konto getestet**. Geprüft ist nur die Auftragssignatur gegen das Beispiel aus der Kraken-Dokumentation. Mindestordergrößen von Kraken werden nicht abgefragt, und im Log steht der Referenzkurs statt des tatsächlichen Ausführungskurses. Vor dem ersten echten Einsatz sollte das mit einem Kleinstbetrag verprobt werden.
 
-## Später: Aktien und ETFs
+## Später: Live-Handel für Aktien und ETFs
 
-Die Entscheidungslogik kennt nur zwei Schnittstellen: einen Markt (`price`, `daily_closes`) und einen Broker (`get_cash`, `get_qty`, `market_order`). Für Aktien und ETFs kommen ein weiterer Markt und ein weiterer Broker dazu (z. B. Alpaca oder Interactive Brokers) sowie eine Prüfung der Börsenzeiten.
+Die Entscheidungslogik kennt nur zwei Schnittstellen: einen Markt (`price`, `spread`, `daily_closes`) und einen Broker (`get_cash`, `get_qty`, `market_order`). Für echten Aktien- und ETF-Handel fehlt noch die Anbindung an einen Broker mit Programmierschnittstelle, zum Beispiel Interactive Brokers, sowie eine Prüfung der Börsenzeiten.

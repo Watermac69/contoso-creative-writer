@@ -2,13 +2,13 @@ import json
 
 import pytest
 
-from agent.backtest import run_backtest
+from agent.backtest import align, run_backtest
 from agent.brokers import PaperBroker, kraken_signature
-from agent.config import Config, load_config
+from agent.config import Asset, Config, load_config
 from agent.engine import DAY, Engine, State
 from agent.journal import Journal
 from agent.llm_filter import parse_multipliers
-from agent.market import Candle
+from agent.market import Candle, to_eur
 from agent.strategy import Signal, compute_signal, target_weights
 
 
@@ -211,7 +211,7 @@ def test_backtest_runs_on_synthetic_history_without_lookahead():
     result = run_backtest(Config(), candles)
     assert result.trades >= 3
     assert result.end > result.start  # steady uptrend must be profitable
-    assert not result.halted
+    assert result.halts == 0
 
 
 def test_every_order_carries_its_reason():
@@ -310,3 +310,118 @@ def test_journal_keeps_llm_answers_with_the_headlines_shown():
     ).fetchall()
     assert rows[0] == ("BTC", 0.5, "exchange hack", '["headline"]')
     assert len(rows) == 3
+
+
+def many(n):
+    return [Asset(f"S{i}") for i in range(n)]
+
+
+def sig(symbol, momentum, active=True):
+    return Signal(symbol, active, 100, momentum, 0.1, "")
+
+
+def test_top_n_picks_strongest_and_buffer_keeps_held_positions():
+    cfg = Config(universe=many(6), top_n=2, rank_buffer=1, max_position_weight=0.5)
+    signals = [sig("S0", 0.5), sig("S1", 0.4), sig("S2", 0.3), sig("S3", 0.2),
+               sig("S4", 0.9, active=False), sig("S5", 0.1)]
+    w = target_weights(signals, {}, cfg)
+    assert {s for s, x in w.items() if x > 0} == {"S0", "S1"}  # inactive S4 never chosen
+    assert w["S0"] == pytest.approx(0.95 / 2)
+    # S2 is rank 3: inside top_n + buffer, so a held S2 keeps its slot over newcomer S1
+    w = target_weights(signals, {}, cfg, held={"S2"})
+    assert {s for s, x in w.items() if x > 0} == {"S2", "S0"}
+    # S3 is rank 4: outside the buffer, it is dropped
+    w = target_weights(signals, {}, cfg, held={"S3"})
+    assert {s for s, x in w.items() if x > 0} == {"S0", "S1"}
+
+
+def test_market_filter_blocks_new_positions_but_keeps_held_ones():
+    cfg = Config(universe=many(4), top_n=2)
+    signals = [sig("S0", 0.5), sig("S1", 0.4), sig("S2", 0.3), sig("S3", 0.2)]
+    w = target_weights(signals, {}, cfg, held={"S1"}, allow_new=False)
+    assert {s for s, x in w.items() if x > 0} == {"S1"}
+
+
+def test_engine_applies_market_filter_from_benchmark():
+    cfg = Config(benchmark="IDX", regime_window=50)
+    closes = dict(ALL_UP, IDX=falling())
+    engine, broker, market = make_engine(closes, cfg)
+    result = engine.run_cycle(0.0)
+    assert result.fills == []
+    assert any("market filter" in n for n in result.notes)
+    market.closes["IDX"] = rising()
+    assert len(engine.run_cycle(900.0).fills) == 3
+
+
+def test_rebalance_cadence_skips_reranking_but_stops_still_fire():
+    cfg = Config(rebalance_days=7, max_drawdown=0.9)
+    engine, broker, market = make_engine(ALL_UP, cfg)
+    engine.run_cycle(0.0)
+    market.closes["ETH"] = falling()  # trend ended, but no re-ranking before day 7
+    market.prices["BTC"] = 100.0  # stop breached
+    fills = engine.run_cycle(2 * DAY).fills
+    assert [(f.symbol, f.reason) for f in fills] == [("BTC", "trailing stop")]
+    market.prices["ETH"] = 175.0
+    later = engine.run_cycle(7 * DAY).fills
+    assert ("ETH", "trend ended") in [(f.symbol, f.reason) for f in later]
+
+
+def test_kill_switch_resumes_automatically_after_halt_days():
+    cfg = Config(halt_days=30)
+    engine, broker, market = make_engine(ALL_UP, cfg)
+    engine.run_cycle(0.0)
+    good = dict(market.prices)
+    market.prices = {s: p * 0.6 for s, p in good.items()}
+    engine.run_cycle(DAY)
+    assert engine.state.halted
+    market.prices = good
+    assert engine.run_cycle(10 * DAY).fills == []
+    result = engine.run_cycle(31 * DAY + 1)
+    assert not engine.state.halted
+    assert len(result.fills) == 3
+    assert engine.state.peak_equity < 1000  # drawdown now counts from the resume level
+
+
+def test_minimum_fee_applies_and_is_budgeted():
+    cfg = Config(fee_rate=0.0005, min_fee_eur=1.25)
+    broker = PaperBroker(cfg)
+    assert broker.market_order("BTC", "buy", 1.0, 100.0).fee == 1.25
+    assert broker.market_order("BTC", "sell", 1.0, 100.0).fee == 1.25
+    cfg = Config(fee_rate=0.0005, min_fee_eur=1.25, max_position_weight=1.0, max_exposure=1.0,
+                 universe=[Asset("BTC")], target_vol=10.0)
+    engine, broker, _ = make_engine({"BTC": rising()}, cfg)
+    engine.run_cycle(0.0)  # wants 100 % of equity: must still leave room for the fee
+    assert broker.get_cash() >= 0
+
+
+def test_align_fills_holidays_and_marks_days_before_listing():
+    a = [Candle(0, 1, 1, 1, 1), Candle(DAY, 2, 2, 2, 2), Candle(2 * DAY, 3, 3, 3, 3)]
+    b = [Candle(DAY, 9, 9, 9, 9)]
+    out = align({"A": a, "B": b})
+    assert out["B"][0] is None
+    assert out["B"][2].close == 9 and out["B"][2].open == 9  # holiday repeats last close
+    assert [c.close for c in out["A"]] == [1, 2, 3]
+
+
+def test_backtest_ignores_assets_before_their_listing():
+    n = 300
+    old = [Candle(i * DAY, 100 + i, 101 + i, 99 + i, 100 + i) for i in range(n)]
+    young = [Candle(i * DAY, 50 + i, 51 + i, 49 + i, 50 + i) for i in range(250, n)]
+    cfg = Config(universe=[Asset("OLD"), Asset("YOUNG")])
+    result = run_backtest(cfg, {"OLD": old, "YOUNG": young})
+    assert result.end > result.start
+    assert "Buy & hold all 1, equal" in result.benchmarks  # YOUNG lacks full history
+
+
+def test_usd_prices_are_converted_with_the_latest_known_rate():
+    usd = [Candle(DAY, 110, 110, 110, 110), Candle(2 * DAY, 120, 120, 120, 120)]
+    fx = [Candle(0, 1.0, 1.0, 1.0, 1.0), Candle(DAY, 1.1, 1.1, 1.1, 1.1)]
+    eur = to_eur(usd, fx)
+    assert eur[0].close == pytest.approx(100)
+    assert eur[1].close == pytest.approx(120 / 1.1)  # no rate for day 2: previous one is used
+
+
+def test_named_universe_profiles_load():
+    for name, count in (("config.stocks.json", 100), ("config.etf.json", 4)):
+        cfg = load_config(name)
+        assert cfg.market == "yahoo" and len(cfg.universe) >= count

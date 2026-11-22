@@ -51,13 +51,16 @@ class PaperBroker:
     def get_qty(self, symbol: str) -> float:
         return self.qty.get(symbol, 0.0)
 
+    def _fee(self, value: float) -> float:
+        return max(self.cfg.min_fee_eur, value * self.cfg.fee_rate)
+
     def market_order(self, symbol: str, side: str, qty: float, ref_price: float) -> Fill:
         if qty <= 0:
             raise ValueError("qty must be positive")
         if side == "buy":
             price = ref_price * (1 + self.cfg.slippage)
             cost = qty * price
-            fee = cost * self.cfg.fee_rate
+            fee = self._fee(cost)
             if cost + fee > self.cash + 1e-9:
                 raise ValueError("not enough cash")
             self.cash -= cost + fee
@@ -66,7 +69,7 @@ class PaperBroker:
             qty = min(qty, self.get_qty(symbol))
             price = ref_price * (1 - self.cfg.slippage)
             proceeds = qty * price
-            fee = proceeds * self.cfg.fee_rate
+            fee = self._fee(proceeds)
             self.cash += proceeds - fee
             self.qty[symbol] = self.get_qty(symbol) - qty
             if self.qty[symbol] < 1e-12:
@@ -135,6 +138,9 @@ class KrakenBroker:
 def make_broker(cfg: Config):
     if cfg.mode == "paper":
         return PaperBroker(cfg, Path(cfg.state_dir) / "paper_account.json")
+    if cfg.market != "kraken":
+        raise SystemExit("Live trading is only implemented for Kraken. Stocks and ETFs "
+                         "run in paper mode until a broker connection is added.")
     if os.environ.get("LIVE_TRADING_CONFIRM") != "yes":
         raise SystemExit(
             "Live mode is locked. Set LIVE_TRADING_CONFIRM=yes together with "

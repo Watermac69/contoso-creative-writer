@@ -12,7 +12,7 @@ from .config import load_config
 from .engine import Engine, State
 from .journal import Journal
 from .llm_filter import LLMFilter
-from .market import KrakenMarket, fetch_headlines
+from .market import KrakenMarket, YahooMarket, fetch_headlines
 
 
 def build(cfg):
@@ -21,7 +21,7 @@ def build(cfg):
     state = State.load(state_path)
     llm = LLMFilter(cfg)
     engine = Engine(
-        cfg, make_broker(cfg), KrakenMarket(cfg), state,
+        cfg, make_broker(cfg), YahooMarket(cfg) if cfg.market == "yahoo" else KrakenMarket(cfg), state,
         llm=llm if llm.enabled else None,
         news=lambda: fetch_headlines(cfg.news_feeds),
         journal=Journal(state_dir / "agent.db"),
@@ -57,6 +57,7 @@ def main() -> None:
 
     if args.command == "reset-halt":
         state.halted, state.halt_reason, state.peak_equity = False, "", 0.0
+        state.halted_until = 0.0
         state.save(state_path)
         print("Halt cleared. The drawdown limit now counts from the current equity.")
     elif args.command == "status":

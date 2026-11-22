@@ -68,6 +68,73 @@ class KrakenMarket:
         return [c.close for c in candles[:-1]]  # completed days only
 
 
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/"
+
+
+def fetch_yahoo(ticker: str, history: str = "2y") -> tuple[list[Candle], float]:
+    """Daily candles adjusted for dividends and splits, plus the latest price."""
+    r = requests.get(YAHOO + ticker, params={"range": history, "interval": "1d"},
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=TIMEOUT)
+    r.raise_for_status()
+    result = r.json()["chart"]["result"][0]
+    quote = result["indicators"]["quote"][0]
+    adj = result["indicators"]["adjclose"][0]["adjclose"]
+    candles = []
+    for i, t in enumerate(result["timestamp"]):
+        o, h, l, c, a = quote["open"][i], quote["high"][i], quote["low"][i], quote["close"][i], adj[i]
+        if None in (o, h, l, c, a) or c <= 0:
+            continue
+        f = a / c
+        candles.append(Candle(int(t) // 86400 * 86400, o * f, h * f, l * f, a))
+    return candles, float(result["meta"]["regularMarketPrice"])
+
+
+def to_eur(candles: list[Candle], fx: list[Candle]) -> list[Candle]:
+    """Convert USD candles to EUR with the EURUSD close of the same or previous day."""
+    out, j, rate = [], 0, fx[0].close
+    for c in candles:
+        while j < len(fx) and fx[j].time <= c.time:
+            rate = fx[j].close
+            j += 1
+        out.append(Candle(c.time, c.open / rate, c.high / rate, c.low / rate, c.close / rate))
+    return out
+
+
+class YahooMarket:
+    """Stocks and ETFs in EUR. Yahoo gives no bid/ask, so the spread is reported as 0."""
+
+    def __init__(self, cfg: Config, history: str = "2y"):
+        self.cfg, self.history = cfg, history
+        self._cache: dict[str, tuple[float, list[Candle], float]] = {}
+
+    def _load(self, ticker: str) -> tuple[list[Candle], float]:
+        cached = self._cache.get(ticker)
+        if cached and time.monotonic() - cached[0] < 600:
+            return cached[1], cached[2]
+        candles, last = fetch_yahoo(ticker, self.history)
+        self._cache[ticker] = (time.monotonic(), candles, last)
+        return candles, last
+
+    def _currency(self, symbol: str) -> str:
+        return next((a.currency for a in self.cfg.universe if a.symbol == symbol), "EUR")
+
+    def price(self, symbol: str) -> float:
+        last = self._load(symbol)[1]
+        if self._currency(symbol) == "USD":
+            last /= self._load("EURUSD=X")[1]
+        return last
+
+    def spread(self, symbol: str) -> float:
+        return 0.0
+
+    def daily_closes(self, symbol: str) -> list[float]:
+        candles = self._load(symbol)[0]
+        if self._currency(symbol) == "USD":
+            candles = to_eur(candles, self._load("EURUSD=X")[0])
+        today = int(time.time()) // 86400 * 86400
+        return [c.close for c in candles if c.time < today]  # completed days only
+
+
 def fetch_headlines(feeds: list[str], limit: int = 25) -> list[str]:
     """Recent headline titles. Failures are tolerated: news is optional."""
     titles: list[str] = []
