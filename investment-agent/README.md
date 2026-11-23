@@ -4,6 +4,8 @@ Ein eigenständiger Handelsagent, der ein Startkapital (Standard: 1.000 €) sel
 
 > **Kein Gewinnversprechen.** Der Agent kann Geld verlieren, im Live-Betrieb echtes. Die eingebauten Grenzen begrenzen Verluste, verhindern sie aber nicht. Das hier ist Software, keine Anlageberatung.
 
+Entscheidungen, offene Punkte und der Verlauf stehen im [Projektprotokoll](docs/PROJEKT.md).
+
 ## Vier Profile
 
 | Profil | Start mit | Was er handelt | Kursquelle | Live-Handel |
