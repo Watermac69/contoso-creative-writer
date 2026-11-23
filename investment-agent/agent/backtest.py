@@ -36,9 +36,12 @@ class HistoricalMarket:
     def spread(self, symbol: str) -> float:
         return 0.0  # historical spreads are unknown; costs are covered by cfg.slippage
 
-    def daily_closes(self, symbol: str) -> list[float]:
+    def daily_bars(self, symbol: str) -> list[Candle]:
         window = self.candles[symbol][max(0, self.i - LOOKBACK): self.i]
-        return [c.close for c in window if c]
+        return [c for c in window if c]
+
+    def daily_closes(self, symbol: str) -> list[float]:
+        return [c.close for c in self.daily_bars(symbol)]
 
 
 @dataclass
@@ -106,6 +109,7 @@ def run_backtest(cfg: Config, candles: dict[str, list[Candle]]) -> BacktestResul
     calendar = [c.time for c in next(cs for cs in candles.values() if cs[0])]
     n = len(calendar)
     warmup = max(cfg.trend_window, cfg.momentum_window + 1, cfg.vol_window + 1, cfg.regime_window)
+    warmup = min(warmup, LOOKBACK)
     if n <= warmup + 1:
         raise ValueError("not enough history for a backtest")
 

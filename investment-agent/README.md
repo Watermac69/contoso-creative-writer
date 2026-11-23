@@ -4,15 +4,16 @@ Ein eigenständiger Handelsagent, der ein Startkapital (Standard: 1.000 €) sel
 
 > **Kein Gewinnversprechen.** Der Agent kann Geld verlieren, im Live-Betrieb echtes. Die eingebauten Grenzen begrenzen Verluste, verhindern sie aber nicht. Das hier ist Software, keine Anlageberatung.
 
-## Drei Profile
+## Vier Profile
 
 | Profil | Start mit | Was er handelt | Kursquelle | Live-Handel |
 |---|---|---|---|---|
 | Krypto | `config.json` | BTC, ETH, SOL | Kraken | vorbereitet (Kraken), gesperrt |
 | Aktien | `config.stocks.json` | die 5 stärksten aus rund 140 großen US- und DAX-Aktien | Yahoo Finance | noch nicht möglich |
 | ETFs | `config.etf.json` | Aktien Welt, Schwellenländer, Anleihen, Gold | Yahoo Finance | noch nicht möglich |
+| Markttechnik | `config.markttechnik.json` | Ausbrüche aus denselben rund 140 Aktien | Yahoo Finance | noch nicht möglich |
 
-Jedes Profil hat ein eigenes Paper-Konto und Journal (`state/`, `state-stocks/`, `state-etf/`). Alle Befehle unten nehmen `--config`, zum Beispiel `python -m agent run --config config.stocks.json`.
+Jedes Profil hat ein eigenes Paper-Konto und Journal (`state/`, `state-stocks/`, `state-etf/`, `state-markttechnik/`). Alle Befehle unten nehmen `--config`, zum Beispiel `python -m agent run --config config.stocks.json`.
 
 ### So wählt das Aktien-Profil aus
 
@@ -24,6 +25,16 @@ Jedes Profil hat ein eigenes Paper-Konto und Journal (`state/`, `state-stocks/`,
 - **Kosten:** 0,05 % pro Order, mindestens 1,25 €, dazu 0,1 % Slippage. US-Kurse werden in Euro umgerechnet.
 
 Das ETF-Profil nutzt dieselben Regeln ohne Rangliste, prüft alle vier Wochen und hat engere Grenzen (Stop 12 %, Not-Aus 15 %).
+
+### So handelt das Markttechnik-Profil
+
+Es folgt der Chartstruktur statt gleitenden Durchschnitten. Die Regeln sind Standardannahmen und noch nicht mit einem erfahrenen Markttechnik-Trader abgestimmt.
+
+- **Trend:** Ein Aufwärtstrend ist eine Folge höherer Hochs und höherer Tiefs im Tageschart. Ein Hoch oder Tief zählt, wenn es die drei Tage davor und danach über- bzw. unterbietet.
+- **Einstieg:** Kauf, wenn der Schlusskurs über das letzte Hoch ausbricht, höchstens drei Tage nach dem Ausbruch und nur, solange der Kurs noch darüber liegt.
+- **Stopp:** am letzten Tief. Mit jedem neuen, höheren Tief wandert er nach oben.
+- **Positionsgröße:** so, dass ein ausgelöster Stopp 1 % des Vermögens kostet, höchstens 20 % des Vermögens pro Aktie. Kein Hebel, nur steigende Kurse.
+- **Marktfilter und Not-Aus:** wie beim Aktien-Profil.
 
 ## Wie er entscheidet (Krypto-Profil)
 
@@ -128,6 +139,20 @@ So ist das zu lesen:
 - Die Parameter wurden vorab festgelegt und nicht auf diese Daten optimiert.
 
 Nachrechnen: `python -m agent backtest --config config.stocks.json` (lädt zehn Jahre Kurse, dauert rund eine Minute).
+
+### Markttechnik-Profil: mit den Standardannahmen nicht brauchbar
+
+Derselbe Zeitraum, dieselben Kosten:
+
+| | Rendite pro Jahr | Größter Rückgang | Orders |
+|---|---|---|---|
+| Markttechnik, 1.000 € Start | −14,2 % | 77,1 % | 656 |
+| Markttechnik, 10.000 € Start | +0,2 % | 29,2 % | 1.713 |
+| zum Vergleich: Tiefs und Hochs über 5 statt 3 Tage, 10.000 € | +5,2 % | 25,1 % | 1.260 |
+
+- Die Regeln erzeugen sehr viele kurze Trades mit engen Stopps. Bei 1.000 € fressen die Mindestgebühren (820 €) das Konto auf.
+- Auch ohne Gebührenproblem bleibt bei 10.000 € nichts übrig. Die Variante mit 5 Tagen ist besser, liegt aber weiter klar unter dem Aktien-Profil und dem Weltindex.
+- Das Ergebnis hängt stark an der Zeitebene. Welche ein erfahrener Trader tatsächlich nutzt, ist die wichtigste offene Frage. Der Backtest dieses Profils dauert mehrere Minuten.
 
 **Grenzen des Aktien- und ETF-Profils:** Der Paper-Handel bucht zum letzten bekannten Kurs, auch wenn die Börse geschlossen ist. Bruchteile von Aktien werden vorausgesetzt. Yahoo liefert keine Kauf- und Verkaufskurse, die Spannen-Prüfung greift hier also nicht.
 

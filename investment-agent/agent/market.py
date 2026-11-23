@@ -63,9 +63,11 @@ class KrakenMarket:
         ask, bid = float(t["a"][0]), float(t["b"][0])
         return (ask - bid) / ((ask + bid) / 2)
 
+    def daily_bars(self, symbol: str) -> list[Candle]:
+        return fetch_daily_candles(self.cfg.asset(symbol).pair)[:-1]  # completed days only
+
     def daily_closes(self, symbol: str) -> list[float]:
-        candles = fetch_daily_candles(self.cfg.asset(symbol).pair)
-        return [c.close for c in candles[:-1]]  # completed days only
+        return [c.close for c in self.daily_bars(symbol)]
 
 
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -127,12 +129,15 @@ class YahooMarket:
     def spread(self, symbol: str) -> float:
         return 0.0
 
-    def daily_closes(self, symbol: str) -> list[float]:
+    def daily_bars(self, symbol: str) -> list[Candle]:
         candles = self._load(symbol)[0]
         if self._currency(symbol) == "USD":
             candles = to_eur(candles, self._load("EURUSD=X")[0])
         today = int(time.time()) // 86400 * 86400
-        return [c.close for c in candles if c.time < today]  # completed days only
+        return [c for c in candles if c.time < today]  # completed days only
+
+    def daily_closes(self, symbol: str) -> list[float]:
+        return [c.close for c in self.daily_bars(symbol)]
 
 
 def fetch_headlines(feeds: list[str], limit: int = 25) -> list[str]:

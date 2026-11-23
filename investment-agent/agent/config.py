@@ -29,6 +29,13 @@ class Config:
     state_dir: str = "state"
     universe: list[Asset] = field(default_factory=lambda: list(DEFAULT_UNIVERSE))
 
+    # "trend": moving-average trend with target weights (crypto, stocks, ETFs)
+    # "markttechnik": swing-structure breakouts with risk-based position size
+    strategy: str = "trend"
+    swing_bars: int = 3  # bars on each side that define a swing high or low
+    breakout_max_age: int = 3  # enter only this many bars after the breakout at most
+    risk_per_trade: float = 0.01  # share of equity lost if the stop is hit
+
     # Strategy (daily candles)
     trend_window: int = 50  # price must be above this moving average
     momentum_window: int = 30  # and the return over this many days must be positive
@@ -93,6 +100,8 @@ def load_config(path: str | Path = "config.json") -> Config:
         setattr(cfg, key, value)
     if cfg.mode not in ("paper", "live"):
         raise ValueError("mode must be 'paper' or 'live'")
+    if cfg.strategy not in ("trend", "markttechnik"):
+        raise ValueError("strategy must be 'trend' or 'markttechnik'")
     if cfg.market not in ("kraken", "yahoo"):
         raise ValueError("market must be 'kraken' or 'yahoo'")
     return cfg

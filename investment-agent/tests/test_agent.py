@@ -8,6 +8,7 @@ from agent.config import Asset, Config, load_config
 from agent.engine import DAY, Engine, State
 from agent.journal import Journal
 from agent.llm_filter import parse_multipliers
+from agent.markttechnik import analyse, swing_points
 from agent.market import Candle, to_eur
 from agent.strategy import Signal, compute_signal, target_weights
 
@@ -26,6 +27,9 @@ class FakeMarket:
 
     def daily_closes(self, symbol):
         return self.closes[symbol]
+
+    def daily_bars(self, symbol):
+        return self.bars[symbol]
 
 
 def rising(n=80, start=100.0, step=1.0):
@@ -422,6 +426,106 @@ def test_usd_prices_are_converted_with_the_latest_known_rate():
 
 
 def test_named_universe_profiles_load():
-    for name, count in (("config.stocks.json", 100), ("config.etf.json", 4)):
+    for name, count in (("config.stocks.json", 100), ("config.etf.json", 4),
+                        ("config.markttechnik.json", 100)):
         cfg = load_config(name)
         assert cfg.market == "yahoo" and len(cfg.universe) >= count
+
+
+def bars_from(points):
+    """Bars from (high, low) pairs; the close sits just below the high."""
+    return [Candle(i * DAY, lo, hi, lo, hi - 0.1) for i, (hi, lo) in enumerate(points)]
+
+
+def zigzag(*turns, start=95.0):
+    """Price path through the turning points, one point of range per bar."""
+    path, level = [], start
+    for target in turns:
+        step = 1 if target > level else -1
+        while level != target:
+            level += step
+            path.append((level + 1, level))
+    return bars_from(path)
+
+
+def test_swing_points_need_bars_on_both_sides():
+    bars = zigzag(100, 96, 104, 99)
+    highs, lows = swing_points(bars, 2)
+    assert [p for _, p in highs] == [101, 105]
+    assert [p for _, p in lows] == [96]  # the final 99 has no bars after it yet
+
+
+def test_analyse_finds_uptrend_breakout_and_stop():
+    cfg = Config(swing_bars=2)
+    bars = zigzag(100, 96, 104, 100, 106)  # higher highs, higher lows, now above 105
+    su = analyse("X", bars, cfg)
+    assert su.uptrend and su.swing_high == 105 and su.swing_low == 100
+    assert su.breakout_age == 1  # the close first exceeded 105 on the bar before the last
+    down = analyse("X", zigzag(100, 96, 99, 92, 95, start=104.0), cfg)
+    assert not down.uptrend
+
+
+def mt_engine(bars, **kw):
+    cfg = Config(strategy="markttechnik", swing_bars=2, universe=[Asset("X")],
+                 max_position_weight=0.5, **kw)
+    broker = PaperBroker(cfg)
+    market = FakeMarket({"X": [b.close for b in bars]})
+    market.bars = {"X": bars}
+    return Engine(cfg, broker, market, State()), broker, market
+
+
+def test_markttechnik_enters_on_breakout_with_risk_based_size():
+    bars = zigzag(100, 96, 104, 100, 106)
+    engine, broker, market = mt_engine(bars)
+    market.prices["X"] = 106.0
+    fills = engine.run_cycle(0.0).fills
+    assert [(f.side, f.reason) for f in fills] == [("buy", "breakout")]
+    assert engine.state.stops["X"] == 100
+    # 1 % of 1000 EUR at risk over a 6-point stop distance
+    assert fills[0].qty * (106.0 - 100) == pytest.approx(10.0, rel=0.01)
+
+
+def test_markttechnik_caps_position_and_skips_stale_breakouts():
+    bars = zigzag(100, 96, 104, 100, 106)  # risk sizing alone would give about 18 %
+    engine, broker, market = mt_engine(bars, max_drawdown=0.9)
+    engine.cfg.max_position_weight = 0.1
+    market.prices["X"] = 106.0
+    fill = engine.run_cycle(0.0).fills[0]
+    assert fill.qty * fill.price == pytest.approx(100.0, rel=0.01)
+
+    stale = zigzag(100, 96, 104, 100, 112)  # broke out 6 bars ago
+    engine, _, market = mt_engine(stale)
+    market.prices["X"] = 112.0
+    assert engine.run_cycle(0.0).fills == []
+
+
+def test_markttechnik_stop_trails_up_and_sells():
+    bars = zigzag(100, 96, 104, 100, 106)
+    engine, broker, market = mt_engine(bars, max_drawdown=0.9)
+    market.prices["X"] = 106.0
+    engine.run_cycle(0.0)
+    higher = zigzag(100, 96, 104, 100, 110, 105, 109)  # new swing low at 105
+    market.bars["X"] = higher
+    market.prices["X"] = 109.0
+    assert engine.run_cycle(DAY).fills == []
+    assert engine.state.stops["X"] == 105
+    market.prices["X"] = 104.0
+    fills = engine.run_cycle(2 * DAY).fills
+    assert [(f.side, f.reason) for f in fills] == [("sell", "swing stop")]
+    assert "X" not in engine.state.stops
+    assert engine.run_cycle(3 * DAY).fills == []  # cooldown
+
+
+def test_markttechnik_respects_market_filter():
+    bars = zigzag(100, 96, 104, 100, 106)
+    engine, broker, market = mt_engine(bars, benchmark="IDX", regime_window=50)
+    market.prices["X"] = 106.0
+    market.closes["IDX"] = falling()
+    assert engine.run_cycle(0.0).fills == []
+
+
+def test_markttechnik_skips_breakouts_that_fell_back():
+    bars = zigzag(100, 96, 104, 100, 106)
+    engine, _, market = mt_engine(bars)
+    market.prices["X"] = 104.5  # back below the swing high of 105
+    assert engine.run_cycle(0.0).fills == []

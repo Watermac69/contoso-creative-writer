@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .brokers import Fill
 from .config import Config
+from .markttechnik import analyse
 from .strategy import compute_signal, target_weights
 
 DAY = 86400
@@ -19,6 +20,7 @@ class State:
     halt_reason: str = ""
     halted_until: float = 0.0
     last_rebalance: float = -1e18
+    stops: dict[str, float] = field(default_factory=dict)  # markttechnik stop per position
     high_water: dict[str, float] = field(default_factory=dict)  # highest price since entry
     cost_basis: dict[str, float] = field(default_factory=dict)  # average cost per unit, fees included
     cooldown_until: dict[str, float] = field(default_factory=dict)
@@ -118,6 +120,10 @@ class Engine:
                          else "halted - no trading until 'reset-halt'")
             return self._finish(now, prices, fills, notes, decisions)
 
+        if cfg.strategy == "markttechnik":
+            self._markttechnik(now, symbols, held, prices, due, fills, notes, decisions)
+            return self._finish(now, prices, fills, notes, decisions)
+
         # 2. Trailing stops (protective: executed regardless of spread)
         blocked = {s for s in symbols if st.cooldown_until.get(s, 0) > now}
         for s in held:
@@ -197,6 +203,94 @@ class Engine:
                 self._order(s, "buy", spend / prices[s], prices[s], why, fills)
                 st.high_water[s] = max(st.high_water.get(s, 0.0), prices[s])
         return self._finish(now, prices, fills, notes, decisions)
+
+    def _allow_new(self, notes: list[str]) -> bool:
+        cfg = self.cfg
+        if not (cfg.benchmark and cfg.regime_window):
+            return True
+        bench = self.market.daily_closes(cfg.benchmark)
+        if len(bench) < cfg.regime_window:
+            return True
+        ok = bench[-1] > sum(bench[-cfg.regime_window:]) / cfg.regime_window
+        if not ok:
+            notes.append(f"market filter: {cfg.benchmark} below its "
+                         f"{cfg.regime_window}d average, no new positions")
+        return ok
+
+    def _markttechnik(self, now, symbols, held, prices, due, fills, notes, decisions) -> None:
+        """Swing-structure strategy: exit at the trailing swing-low stop, enter on
+        fresh breakouts, size each position so the stop costs risk_per_trade."""
+        cfg, st = self.cfg, self.state
+        setups = {}
+
+        def setup(s):
+            if s not in setups:
+                setups[s] = analyse(s, self.market.daily_bars(s), cfg)
+            return setups[s]
+
+        def record(s, target):
+            su = setup(s)
+            notes.append(f"{s}: {su.reason}")
+            decisions.append({
+                "symbol": s, "price": prices[s], "spread": 0.0, "active": su.uptrend,
+                "momentum": su.momentum, "vol": 0.0, "llm_multiplier": 1.0,
+                "target_weight": target, "reason": su.reason,
+            })
+
+        blocked = {s for s in symbols if st.cooldown_until.get(s, 0) > now}
+        holding = set()
+        for s in held:
+            price = prices[s]
+            if self.broker.get_qty(s) * price < 1.0:
+                st.stops.pop(s, None)
+                continue
+            su = setup(s)
+            stop = st.stops.get(s, 0.0)
+            if stop < su.swing_low < price:
+                stop = su.swing_low  # a new, higher swing low: the stop follows
+            st.stops[s] = stop
+            if price < stop or su.last_low < stop:
+                notes.append(f"stop {s}: {stop:.2f}")
+                self._sell_all(s, price, "swing stop", fills)
+                st.stops.pop(s, None)
+                st.cooldown_until[s] = now + cfg.stop_cooldown_days * DAY
+                blocked.add(s)
+            else:
+                holding.add(s)
+        if not due:
+            return
+        st.last_rebalance = now
+        if not self._allow_new(notes):
+            return
+
+        candidates = []
+        for s in symbols:
+            if s in holding or s in blocked or prices[s] <= 0:
+                continue
+            su = setup(s)
+            fresh = su.breakout_age is not None and su.breakout_age <= cfg.breakout_max_age
+            still_above = prices[s] > su.swing_high  # not if it already fell back
+            if su.uptrend and fresh and still_above and su.swing_low > 0:
+                candidates.append(su)
+        candidates.sort(key=lambda su: su.momentum, reverse=True)
+
+        qty = {s: self.broker.get_qty(s) for s in holding}
+        invested = sum(qty[s] * prices[s] for s in holding)
+        equity = self.broker.get_cash() + invested
+        for su in candidates:
+            s, price = su.symbol, prices[su.symbol]
+            stop_distance = (price - su.swing_low) / price
+            budget = ((self.broker.get_cash() - cfg.min_fee_eur)
+                      / (1 + cfg.fee_rate + cfg.slippage) * 0.999)
+            value = min(cfg.risk_per_trade * equity / stop_distance,
+                        cfg.max_position_weight * equity,
+                        cfg.max_exposure * equity - invested, budget)
+            if value < cfg.min_order_eur:
+                continue
+            record(s, value / equity)
+            self._order(s, "buy", value / price, price, "breakout", fills)
+            st.stops[s] = su.swing_low
+            invested += value
 
     def _finish(self, now, prices, fills, notes, decisions) -> CycleResult:
         cash = self.broker.get_cash()
