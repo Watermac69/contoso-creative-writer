@@ -1,0 +1,24 @@
+# All four profiles in paper trading, each with its own state folder on the host.
+# Start: docker compose up -d --build    Logs: docker compose logs -f
+x-agent: &agent
+  build: .
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  volumes:
+    - ./data:/app/data
+
+services:
+  crypto:
+    <<: *agent
+    command: ["python", "-u", "-m", "agent", "run", "--config", "config.json", "--state-root", "data"]
+  stocks:
+    <<: *agent
+    command: ["python", "-u", "-m", "agent", "run", "--config", "config.stocks.json", "--state-root", "data"]
+  etf:
+    <<: *agent
+    command: ["python", "-u", "-m", "agent", "run", "--config", "config.etf.json", "--state-root", "data"]
+  markttechnik:
+    <<: *agent
+    command: ["python", "-u", "-m", "agent", "run", "--config", "config.markttechnik.json", "--state-root", "data"]
