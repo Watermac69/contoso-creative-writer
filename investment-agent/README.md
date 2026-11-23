@@ -88,16 +88,24 @@ Bei 15-Minuten-Zyklen wächst die Datei um etwa 400 Zeilen pro Tag. Der Kontosta
 
 ## 24/7-Betrieb
 
-Der Agent braucht einen Rechner, der dauerhaft läuft, zum Beispiel einen kleinen Cloud-Server oder einen Raspberry Pi:
+Der Agent braucht einen Linux-Rechner mit Docker, der dauerhaft läuft und ins Internet darf. Eingehende Ports braucht er nicht. Alle vier Profile starten zusammen im Paper-Trading:
 
 ```bash
-docker build -t investment-agent .
-docker run -d --restart unless-stopped --name agent \
-  -v "$PWD/state:/app/state" --env-file .env investment-agent
-docker logs -f agent
+git clone https://github.com/Watermac69/contoso-creative-writer.git
+cd contoso-creative-writer
+git checkout claude/autonomous-investment-agent-izb9gy
+cd investment-agent
+docker compose up -d --build
+docker compose logs -f                 # mitlesen
+docker compose exec stocks python -m agent status --config config.stocks.json --state-root data
 ```
 
-`.env` legst du aus `.env.example` an.
+- **Daten:** Konten und Journale liegen im Ordner `data/` neben der Compose-Datei und überleben Neustarts und Updates. Diesen Ordner sichern.
+- **Schlüssel:** optional in einer Datei `.env` (Vorlage: `.env.example`). Ohne `.env` läuft alles im Paper-Trading ohne KI-Filter.
+- **Ausgehende Verbindungen:** `api.kraken.com`, `query1.finance.yahoo.com`, `www.coindesk.com`, für den KI-Filter `api.anthropic.com`.
+- **Update:** `git pull && docker compose up -d --build`.
+
+Auf Azure ist eine kleine Linux-VM die passende Form. Container-Dienste mit Netzlaufwerk (Azure Files) vertragen sich schlecht mit der SQLite-Datei des Journals.
 
 ## Backtest-Ergebnis Krypto
 

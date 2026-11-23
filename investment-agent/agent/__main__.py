@@ -46,8 +46,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="agent")
     parser.add_argument("command", choices=["run", "once", "status", "backtest", "reset-halt"])
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--state-root", default="",
+                        help="folder that holds the state directories (e.g. a mounted volume)")
     args = parser.parse_args()
     cfg = load_config(args.config)
+    if args.state_root:
+        cfg.state_dir = str(Path(args.state_root) / cfg.state_dir)
 
     if args.command == "backtest":
         print(format_result(fetch_and_run(cfg)))
